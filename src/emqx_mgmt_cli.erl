@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -23,8 +23,6 @@
 
 -define(PRINT_CMD(Cmd, Descr), io:format("~-48s# ~s~n", [Cmd, Descr])).
 
--import(lists, [foreach/2]).
-
 -export([load/0]).
 
 -export([ status/1
@@ -41,7 +39,7 @@
         , log/1
         , mgmt/1
         , data/1
-        , modules/1
+        , acl/1
         ]).
 
 -define(PROC_INFOKEYS, [status,
@@ -118,13 +116,7 @@ mgmt(_) ->
 
 status([]) ->
     {InternalStatus, _ProvidedStatus} = init:get_status(),
-        emqx_ctl:print("Node ~p is ~p~n", [node(), InternalStatus]),
-    case lists:keysearch(?APP, 1, application:which_applications()) of
-        false ->
-            emqx_ctl:print("~s is not running~n", [?APP]);
-        {value, {?APP, _Desc, Vsn}} ->
-            emqx_ctl:print("~s ~s is running~n", [?APP, Vsn])
-    end;
+    emqx_ctl:print("Node ~p ~s is ~p~n", [node(), emqx_app:get_release(), InternalStatus]);
 status(_) ->
      emqx_ctl:usage("status", "Show broker status").
 
@@ -157,7 +149,7 @@ cluster(["join", SNode]) ->
         ignore ->
             emqx_ctl:print("Ignore.~n");
         {error, Error} ->
-            emqx_ctl:print("Failed to join the cluster: ~p~n", [Error])
+            emqx_ctl:print("Failed to join the cluster: ~0p~n", [Error])
     end;
 
 cluster(["leave"]) ->
@@ -166,7 +158,7 @@ cluster(["leave"]) ->
             emqx_ctl:print("Leave the cluster successfully.~n"),
             cluster(["status"]);
         {error, Error} ->
-            emqx_ctl:print("Failed to leave the cluster: ~p~n", [Error])
+            emqx_ctl:print("Failed to leave the cluster: ~0p~n", [Error])
     end;
 
 cluster(["force-leave", SNode]) ->
@@ -177,7 +169,7 @@ cluster(["force-leave", SNode]) ->
         ignore ->
             emqx_ctl:print("Ignore.~n");
         {error, Error} ->
-            emqx_ctl:print("Failed to remove the node from cluster: ~p~n", [Error])
+            emqx_ctl:print("Failed to remove the node from cluster: ~0p~n", [Error])
     end;
 
 cluster(["status"]) ->
@@ -199,10 +191,8 @@ clients(["show", ClientId]) ->
     if_client(ClientId, fun print/1);
 
 clients(["kick", ClientId]) ->
-    case emqx_cm:kick_session(bin(ClientId)) of
-        ok -> emqx_ctl:print("ok~n");
-        _ -> emqx_ctl:print("Not Found.~n")
-    end;
+    ok = emqx_cm:kick_session(bin(ClientId)),
+    emqx_ctl:print("ok~n");
 
 clients(_) ->
     emqx_ctl:usage([{"clients list",            "List all clients"},
@@ -280,7 +270,7 @@ if_valid_qos(QoS, Fun) ->
     end.
 
 plugins(["list"]) ->
-    foreach(fun print/1, emqx_plugins:list());
+    lists:foreach(fun print/1, emqx_plugins:list());
 
 plugins(["load", Name]) ->
     case emqx_plugins:load(list_to_atom(Name)) of
@@ -320,44 +310,6 @@ plugins(_) ->
                     {"plugins load <Plugin>",   "Load plugin"},
                     {"plugins unload <Plugin>", "Unload plugin"},
                     {"plugins reload <Plugin>", "Reload plugin"}
-                   ]).
-
-%%--------------------------------------------------------------------
-%% @doc Modules Command
-modules(["list"]) ->
-    foreach(fun(Module) -> print({module, Module}) end, emqx_modules:list());
-
-modules(["load", Name]) ->
-    case emqx_modules:load(list_to_atom(Name)) of
-        ok ->
-            emqx_ctl:print("Module ~s loaded successfully.~n", [Name]);
-        {error, Reason}   ->
-            emqx_ctl:print("Load module ~s error: ~p.~n", [Name, Reason])
-    end;
-
-modules(["unload", Name]) ->
-    case emqx_modules:unload(list_to_atom(Name)) of
-        ok ->
-            emqx_ctl:print("Module ~s unloaded successfully.~n", [Name]);
-        {error, Reason} ->
-            emqx_ctl:print("Unload module ~s error: ~p.~n", [Name, Reason])
-    end;
-
-modules(["reload", "emqx_mod_acl_internal" = Name]) ->
-    case emqx_modules:reload(list_to_atom(Name)) of
-        ok ->
-            emqx_ctl:print("Module ~s reloaded successfully.~n", [Name]);
-        {error, Reason} ->
-            emqx_ctl:print("Reload module ~s error: ~p.~n", [Name, Reason])
-    end;
-modules(["reload", Name]) ->
-    emqx_ctl:print("Module: ~p does not need to be reloaded.~n", [Name]);
-
-modules(_) ->
-    emqx_ctl:usage([{"modules list",            "Show loaded modules"},
-                    {"modules load <Module>",   "Load module"},
-                    {"modules unload <Module>", "Unload module"},
-                    {"modules reload <Module>", "Reload module"}
                    ]).
 
 %%--------------------------------------------------------------------
@@ -416,11 +368,11 @@ log(["primary-level"]) ->
     emqx_ctl:print("~s~n", [Level]);
 
 log(["primary-level", Level]) ->
-    emqx_logger:set_primary_log_level(list_to_atom(Level)),
+    _ = emqx_logger:set_primary_log_level(list_to_atom(Level)),
     emqx_ctl:print("~s~n", [emqx_logger:get_primary_log_level()]);
 
 log(["handlers", "list"]) ->
-    [emqx_ctl:print("LogHandler(id=~s, level=~s, destination=~s, status=~s)~n", [Id, Level, Dst, Status])
+    _ = [emqx_ctl:print("LogHandler(id=~s, level=~s, destination=~s, status=~s)~n", [Id, Level, Dst, Status])
         || #{id := Id, level := Level, dst := Dst, status := Status} <- emqx_logger:get_log_handlers()],
     ok;
 
@@ -460,7 +412,7 @@ log(_) ->
 %% @doc Trace Command
 
 trace(["list"]) ->
-    foreach(fun({{Who, Name}, {Level, LogFile}}) ->
+    lists:foreach(fun({{Who, Name}, {Level, LogFile}}) ->
                 emqx_ctl:print("Trace(~s=~s, level=~s, destination=~p)~n", [Who, Name, Level, LogFile])
             end, emqx_tracer:lookup_traces());
 
@@ -509,122 +461,144 @@ trace_off(Who, Name) ->
 %% @doc Listeners Command
 
 listeners([]) ->
-    foreach(fun({{Protocol, ListenOn}, _Pid}) ->
-                Info = [{acceptors,      esockd:get_acceptors({Protocol, ListenOn})},
+    lists:foreach(fun({{Protocol, ListenOn}, _Pid}) ->
+                Info = [{listen_on,      {string, emqx_listeners:format_listen_on(ListenOn)}},
+                        {acceptors,      esockd:get_acceptors({Protocol, ListenOn})},
                         {max_conns,      esockd:get_max_connections({Protocol, ListenOn})},
                         {current_conn,   esockd:get_current_connections({Protocol, ListenOn})},
-                        {shutdown_count, esockd:get_shutdown_count({Protocol, ListenOn})}],
-                    emqx_ctl:print("listener on ~s:~s~n", [Protocol, esockd:to_string(ListenOn)]),
-                foreach(fun({Key, Val}) ->
-                            emqx_ctl:print("  ~-16s: ~w~n", [Key, Val])
-                        end, Info)
+                        {shutdown_count, esockd:get_shutdown_count({Protocol, ListenOn})}
+                       ],
+                    emqx_ctl:print("~s~n", [listener_identifier(Protocol, ListenOn)]),
+                lists:foreach(fun indent_print/1, Info)
             end, esockd:listeners()),
-    foreach(fun({Protocol, Opts}) ->
-                Info = [{acceptors,      maps:get(num_acceptors, proplists:get_value(transport_options, Opts, #{}), 0)},
+    lists:foreach(fun({Protocol, Opts}) ->
+                Port = proplists:get_value(port, Opts),
+                Info = [{listen_on,      {string, emqx_listeners:format_listen_on(Port)}},
+                        {acceptors,      maps:get(num_acceptors, proplists:get_value(transport_options, Opts, #{}), 0)},
                         {max_conns,      proplists:get_value(max_connections, Opts)},
                         {current_conn,   proplists:get_value(all_connections, Opts)},
                         {shutdown_count, []}],
-                    emqx_ctl:print("listener on ~s:~p~n", [Protocol, proplists:get_value(port, Opts)]),
-                foreach(fun({Key, Val}) ->
-                            emqx_ctl:print("  ~-16s: ~w~n", [Key, Val])
-                        end, Info)
+                    emqx_ctl:print("~s~n", [listener_identifier(Protocol, Port)]),
+                lists:foreach(fun indent_print/1, Info)
             end, ranch:info());
 
-listeners(["stop",  Name = "http" ++ _N, ListenOn]) ->
+listeners(["stop",  Name = "http" ++ _N | _MaybePort]) ->
+    %% _MaybePort is to be backward compatible, to stop http listener, there is no need for the port number
     case minirest:stop_http(list_to_atom(Name)) of
         ok ->
-            emqx_ctl:print("Stop ~s listener on ~s successfully.~n", [Name, ListenOn]);
+            emqx_ctl:print("Stop ~s listener successfully.~n", [Name]);
         {error, Error} ->
-            emqx_ctl:print("Failed to stop ~s listener on ~s, error:~p~n", [Name, ListenOn, Error])
+            emqx_ctl:print("Failed to stop ~s listener: ~0p~n", [Name, Error])
     end;
 
-listeners(["stop", Proto, ListenOn]) ->
+listeners(["stop", "mqtt:" ++ _ = Identifier]) ->
+    stop_listener(emqx_listeners:find_by_id(Identifier), Identifier);
+
+listeners(["stop", _Proto, ListenOn]) ->
+    %% this clause is kept to be backward compatible
     ListenOn1 = case string:tokens(ListenOn, ":") of
         [Port]     -> list_to_integer(Port);
         [IP, Port] -> {IP, list_to_integer(Port)}
     end,
-    case emqx_listeners:stop_listener({list_to_atom(Proto), ListenOn1, []}) of
+    stop_listener(emqx_listeners:find_by_listen_on(ListenOn1), ListenOn1);
+
+listeners(["restart", "http:management"]) ->
+    restart_http_listener(http, emqx_management);
+
+listeners(["restart", "https:management"]) ->
+    restart_http_listener(https, emqx_management);
+
+listeners(["restart", "http:dashboard"]) ->
+    restart_http_listener(http, emqx_dashboard);
+
+listeners(["restart", "https:dashboard"]) ->
+    restart_http_listener(https, emqx_dashboard);
+
+listeners(["restart", Identifier]) ->
+    case emqx_listeners:restart_listener(Identifier) of
         ok ->
-            emqx_ctl:print("Stop ~s listener on ~s successfully.~n", [Proto, ListenOn]);
+            emqx_ctl:print("Restarted ~s listener successfully.~n", [Identifier]);
         {error, Error} ->
-            emqx_ctl:print("Failed to stop ~s listener on ~s, error:~p~n", [Proto, ListenOn, Error])
+            emqx_ctl:print("Failed to restart ~s listener: ~0p~n", [Identifier, Error])
     end;
 
 listeners(_) ->
     emqx_ctl:usage([{"listeners",                        "List listeners"},
-                    {"listeners stop    <Proto> <Port>", "Stop a listener"}]).
+                    {"listeners stop    <Identifier>",   "Stop a listener"},
+                    {"listeners stop    <Proto> <Port>", "Stop a listener"},
+                    {"listeners restart <Identifier>",   "Restart a listener"}
+                   ]).
+
+stop_listener(false, Input) ->
+    emqx_ctl:print("No such listener ~p~n", [Input]);
+stop_listener(#{listen_on := ListenOn} = Listener, _Input) ->
+    ID = emqx_listeners:identifier(Listener),
+    ListenOnStr = emqx_listeners:format_listen_on(ListenOn),
+    case emqx_listeners:stop_listener(Listener) of
+        ok ->
+            emqx_ctl:print("Stop ~s listener on ~s successfully.~n", [ID, ListenOnStr]);
+        {error, Reason} ->
+            emqx_ctl:print("Failed to stop ~s listener on ~s: ~0p~n",
+                           [ID, ListenOnStr, Reason])
+    end.
 
 %%--------------------------------------------------------------------
 %% @doc data Command
 
 data(["export"]) ->
-    Rules = emqx_mgmt:export_rules(),
-    Resources = emqx_mgmt:export_resources(),
-    Blacklist = emqx_mgmt:export_blacklist(),
-    Apps = emqx_mgmt:export_applications(),
-    Users = emqx_mgmt:export_users(),
-    AuthClientID = emqx_mgmt:export_auth_clientid(),
-    AuthUsername = emqx_mgmt:export_auth_username(),
-    AuthMnesia = emqx_mgmt:export_auth_mnesia(),
-    AclMnesia = emqx_mgmt:export_acl_mnesia(),
-    Schemas = emqx_mgmt:export_schemas(),
-    Seconds = erlang:system_time(second),
-    {{Y, M, D}, {H, MM, S}} = emqx_mgmt_util:datetime(Seconds),
-    Filename = io_lib:format("emqx-export-~p-~p-~p-~p-~p-~p.json", [Y, M, D, H, MM, S]),
-    NFilename = filename:join([emqx:get_env(data_dir), Filename]),
-    Version = emqx_sys:version(),
-    Data = [{version, erlang:list_to_binary(Version)},
-            {date, erlang:list_to_binary(emqx_mgmt_util:strftime(Seconds))},
-            {rules, Rules},
-            {resources, Resources},
-            {blacklist, Blacklist},
-            {apps, Apps},
-            {users, Users},
-            {auth_clientid, AuthClientID},
-            {auth_username, AuthUsername},
-            {auth_mnesia, AuthMnesia},
-            {acl_mnesia, AclMnesia},
-            {schemas, Schemas}],
-    ok = filelib:ensure_dir(NFilename),
-    case file:write_file(NFilename, emqx_json:encode(Data)) of
-        ok ->
-            emqx_ctl:print("The emqx data has been successfully exported to ~s.~n", [NFilename]);
+    case emqx_mgmt_data_backup:export() of
+        {ok, #{filename := Filename}} ->
+            emqx_ctl:print("The emqx data has been successfully exported to ~s.~n", [Filename]);
         {error, Reason} ->
             emqx_ctl:print("The emqx data export failed due to ~p.~n", [Reason])
     end;
 
 data(["import", Filename]) ->
-    case file:read_file(Filename) of
-        {ok, Json} ->
-            Data = emqx_json:decode(Json, [return_maps]),
-            Version = emqx_mgmt:to_version(maps:get(<<"version">>, Data)),
-            case emqx_mgmt:is_version_supported(Data, Version) of
-                true  ->
-                    try
-                        emqx_mgmt:import_resources(maps:get(<<"resources">>, Data, [])),
-                        emqx_mgmt:import_rules(maps:get(<<"rules">>, Data, [])),
-                        emqx_mgmt:import_blacklist(maps:get(<<"blacklist">>, Data, [])),
-                        emqx_mgmt:import_applications(maps:get(<<"apps">>, Data, [])),
-                        emqx_mgmt:import_users(maps:get(<<"users">>, Data, [])),
-                        emqx_mgmt:import_auth_clientid(maps:get(<<"auth_clientid">>, Data, [])),
-                        emqx_mgmt:import_auth_username(maps:get(<<"auth_username">>, Data, [])),
-                        emqx_mgmt:import_auth_mnesia(maps:get(<<"auth_mnesia">>, Data, [])),
-                        emqx_mgmt:import_acl_mnesia(maps:get(<<"acl_mnesia">>, Data, [])),
-                        emqx_mgmt:import_schemas(maps:get(<<"schemas">>, Data, [])),
-                        emqx_ctl:print("The emqx data has been imported successfully.~n")
-                    catch Class:Reason:Stack ->
-                        emqx_ctl:print("The emqx data import failed due: ~0p~n", [{Class,Reason,Stack}])
-                    end;
-                false ->
-                    emqx_ctl:print("Unsupported version: ~p~n", [Version])
-            end;
+    data(["import", Filename, "--env", "{}"]);
+data(["import", Filename, "--env", Env]) ->
+    case emqx_mgmt_data_backup:import(Filename, Env) of
+        ok ->
+            emqx_ctl:print("The emqx data has been imported successfully.~n");
+        {error, import_failed} ->
+            emqx_ctl:print("The emqx data import failed.~n");
+        {error, unsupported_version} ->
+            emqx_ctl:print("The emqx data import failed: Unsupported version.~n");
         {error, Reason} ->
             emqx_ctl:print("The emqx data import failed: ~0p while reading ~s.~n", [Reason, Filename])
     end;
 
 data(_) ->
-    emqx_ctl:usage([{"data import <File>",   "Import data from the specified file"},
-                    {"data export",          "Export data"}]).
+    emqx_ctl:usage([{"data import <File> [--env '<json>']",
+                     "Import data from the specified file, possibly with overrides"},
+                    {"data export", "Export data"}]).
+
+%%--------------------------------------------------------------------
+%% @doc acl Command
+
+acl(["cache-clean", "node", Node]) ->
+    case emqx_mgmt:clean_acl_cache_all(erlang:list_to_existing_atom(Node)) of
+        ok ->
+            emqx_ctl:print("ACL cache drain started on node ~s.~n", [Node]);
+        {error, Reason} ->
+            emqx_ctl:print("ACL drain failed on node ~s: ~0p.~n", [Node, Reason])
+    end;
+
+acl(["cache-clean", "all"]) ->
+    case emqx_mgmt:clean_acl_cache_all() of
+        ok ->
+            emqx_ctl:print("Started ACL cache drain in all nodes~n");
+        {error, Reason} ->
+            emqx_ctl:print("ACL cache-clean failed: ~p.~n", [Reason])
+    end;
+
+acl(["cache-clean", ClientId]) ->
+    emqx_mgmt:clean_acl_cache(ClientId);
+
+acl(_) ->
+    emqx_ctl:usage([{"acl cache-clean all",             "Clears acl cache on all nodes"},
+                    {"acl cache-clean node <Node>",     "Clears acl cache on given node"},
+                    {"acl cache-clean <ClientId>",      "Clears acl cache for given client"}
+                   ]).
 
 %%--------------------------------------------------------------------
 %% Dump ETS
@@ -640,8 +614,18 @@ dump(_Table, _, '$end_of_table', Result) ->
     lists:reverse(Result);
 
 dump(Table, Tag, Key, Result) ->
-    PrintValue = [print({Tag, Record}) || Record <- ets:lookup(Table, Key)],
-    dump(Table, Tag, ets:next(Table, Key), [PrintValue | Result]).
+    Ls = lists:foldl(fun(Record, Acc) ->
+            try
+                [print({Tag, Record}) | Acc]
+            catch
+                Class : Reason : Stk ->
+                    logger:error("Failed to print ~p, error: {~p, ~p}. "
+                                 "Stacktrace: ~0p",
+                                 [Record, Class, Reason, Stk]),
+                    Acc
+            end
+         end, [], ets:lookup(Table, Key)),
+    dump(Table, Tag, ets:next(Table, Key), [lists:reverse(Ls) | Result]).
 
 print({_, []}) ->
     ok;
@@ -658,7 +642,7 @@ print({client, {ClientId, ChanPid}}) ->
     ClientInfo = maps:get(clientinfo, Attrs, #{}),
     ConnInfo = maps:get(conninfo, Attrs, #{}),
     Session = maps:get(session, Attrs, #{}),
-    Connected = case maps:get(conn_state, Attrs) of
+    Connected = case maps:get(conn_state, Attrs, undefined) of
                     connected -> true;
                     _ -> false
                 end,
@@ -696,10 +680,6 @@ print(#plugin{name = Name, descr = Descr, active = Active}) ->
     emqx_ctl:print("Plugin(~s, description=~s, active=~s)~n",
                   [Name, Descr, Active]);
 
-print({module, {Name, Active}}) ->
-    emqx_ctl:print("Module(~s, description=~s, active=~s)~n",
-                  [Name, Name:description(), Active]);
-
 print({emqx_suboption, {{Pid, Topic}, Options}}) when is_pid(Pid) ->
     emqx_ctl:print("~s -> ~s~n", [maps:get(subid, Options), Topic]).
 
@@ -714,3 +694,30 @@ format(_, Val) ->
     Val.
 
 bin(S) -> iolist_to_binary(S).
+
+indent_print({Key, {string, Val}}) ->
+    emqx_ctl:print("  ~-16s: ~s~n", [Key, Val]);
+indent_print({Key, Val}) ->
+    emqx_ctl:print("  ~-16s: ~w~n", [Key, Val]).
+
+listener_identifier(Protocol, ListenOn) ->
+    case emqx_listeners:find_id_by_listen_on(ListenOn) of
+        false ->
+            atom_to_list(Protocol);
+        ID ->
+            ID
+    end.
+
+restart_http_listener(Scheme, AppName) ->
+    Listeners = application:get_env(AppName, listeners, []),
+    case lists:keyfind(Scheme, 1, Listeners) of
+        false ->
+            emqx_ctl:print("Listener ~s not exists!~n", [AppName]);
+        {Scheme, Port, Options} ->
+            ModName = http_mod_name(AppName),
+            ModName:stop_listener({Scheme, Port, Options}),
+            ModName:start_listener({Scheme, Port, Options})
+    end.
+
+http_mod_name(emqx_management) -> emqx_mgmt_http;
+http_mod_name(Name) -> Name.

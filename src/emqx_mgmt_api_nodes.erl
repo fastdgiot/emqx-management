@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -15,8 +15,6 @@
 %%--------------------------------------------------------------------
 
 -module(emqx_mgmt_api_nodes).
-
--import(minirest, [return/1]).
 
 -rest_api(#{name   => list_nodes,
             method => 'GET',
@@ -35,10 +33,10 @@
         ]).
 
 list(_Bindings, _Params) ->
-    return({ok, [format(Node, Info) || {Node, Info} <- emqx_mgmt:list_nodes()]}).
+    minirest:return({ok, [format(Node, Info) || {Node, Info} <- emqx_mgmt:list_nodes()]}).
 
 get(#{node := Node}, _Params) ->
-    return({ok, emqx_mgmt:lookup_node(Node)}).
+    minirest:return({ok, emqx_mgmt:lookup_node(Node)}).
 
 format(Node, {error, Reason}) -> #{node => Node, error => Reason};
 

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -16,14 +16,18 @@
 
 -module(emqx_mgmt_http).
 
--import(proplists, [get_value/3]).
-
 -export([ start_listeners/0
         , handle_request/2
         , stop_listeners/0
+        , start_listener/1
+        , stop_listener/1
         ]).
 
 -export([init/2]).
+
+-export([ filter/1
+        , authorize_appid/1
+        ]).
 
 -include_lib("emqx/include/emqx.hrl").
 
@@ -56,8 +60,8 @@ start_listener({Proto, Port, Options}) when Proto == https ->
     minirest:start_https(listener_name(Proto), ranch_opts(Port, Options), Dispatch).
 
 ranch_opts(Port, Options0) ->
-    NumAcceptors = get_value(num_acceptors, Options0, 4),
-    MaxConnections = get_value(max_connections, Options0, 512),
+    NumAcceptors = proplists:get_value(num_acceptors, Options0, 4),
+    MaxConnections = proplists:get_value(max_connections, Options0, 512),
     Options = lists:foldl(fun({K, _V}, Acc) when K =:= max_connections orelse K =:= num_acceptors ->
                                  Acc;
                              ({inet6, true}, Acc) -> [inet6 | Acc];
@@ -73,7 +77,8 @@ ranch_opts(Port, Options0) ->
             socket_opts => [{port, Port} | Options]},
     Res.
 
-stop_listener({Proto, _Port, _}) ->
+stop_listener({Proto, Port, _}) ->
+    io:format("Stop http:management listener on ~s successfully.~n",[format(Port)]),
     minirest:stop_http(listener_name(Proto)).
 
 listeners() ->
@@ -84,10 +89,10 @@ listener_name(Proto) ->
 
 http_handlers() ->
     Plugins = lists:map(fun(Plugin) -> Plugin#plugin.name end, emqx_plugins:list()),
-    [{"/api/v4", minirest:handler(#{apps   => Plugins -- ?EXCEPT_PLUGIN,
+    [{"/api/v4", minirest:handler(#{apps   => Plugins ++ [emqx_modules] -- ?EXCEPT_PLUGIN,
                                     except => ?EXCEPT,
-                                    filter => fun filter/1}),
-                 [{authorization, fun authorize_appid/1}]}].
+                                    filter => fun ?MODULE:filter/1}),
+                 [{authorization, fun ?MODULE:authorize_appid/1}]}].
 
 %%--------------------------------------------------------------------
 %% Handle 'status' request
@@ -118,8 +123,22 @@ authorize_appid(Req) ->
          _  -> false
     end.
 
+-ifdef(EMQX_ENTERPRISE).
+filter(_) ->
+    true.
+-else.
+filter(#{app := emqx_modules}) -> true;
 filter(#{app := App}) ->
     case emqx_plugins:find_plugin(App) of
         false -> false;
         Plugin -> Plugin#plugin.active
     end.
+-endif.
+
+
+format(Port) when is_integer(Port) ->
+    io_lib:format("0.0.0.0:~w", [Port]);
+format({Addr, Port}) when is_list(Addr) ->
+    io_lib:format("~s:~w", [Addr, Port]);
+format({Addr, Port}) when is_tuple(Addr) ->
+    io_lib:format("~s:~w", [inet:ntoa(Addr), Port]).

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -19,12 +19,6 @@
 -include_lib("emqx/include/emqx.hrl").
 
 -include("emqx_mgmt.hrl").
-
--import(proplists, [get_value/2]).
-
--import(minirest, [ return/0
-                  , return/1
-                  ]).
 
 -rest_api(#{name   => list_banned,
             method => 'GET',
@@ -50,7 +44,7 @@
         ]).
 
 list(_Bindings, Params) ->
-    return({ok, emqx_mgmt_api:paginate(emqx_banned, Params, fun format/1)}).
+    minirest:return({ok, emqx_mgmt_api:paginate(emqx_banned, Params, fun format/1)}).
 
 create(_Bindings, Params) ->
     case pipeline([fun ensure_required/1,
@@ -58,9 +52,9 @@ create(_Bindings, Params) ->
         {ok, NParams} ->
             {ok, Banned} = pack_banned(NParams),
             ok = emqx_mgmt:create_banned(Banned),
-            return({ok, maps:from_list(Params)});
-        {error, Code, Message} -> 
-            return({error, Code, Message})
+            minirest:return({ok, maps:from_list(Params)});
+        {error, Code, Message} ->
+            minirest:return({error, Code, Message})
     end.
 
 delete(#{as := As, who := Who}, _) ->
@@ -69,10 +63,10 @@ delete(#{as := As, who := Who}, _) ->
     case pipeline([fun ensure_required/1,
                    fun validate_params/1], Params) of
         {ok, NParams} ->
-            do_delete(get_value(<<"as">>, NParams), get_value(<<"who">>, NParams)),
-            return();
-        {error, Code, Message} -> 
-            return({error, Code, Message})
+            do_delete(proplists:get_value(<<"as">>, NParams), proplists:get_value(<<"who">>, NParams)),
+            minirest:return();
+        {error, Code, Message} ->
+            minirest:return({error, Code, Message})
     end.
 
 pipeline([], Params) ->
@@ -99,7 +93,7 @@ ensure_required(Params) when is_list(Params) ->
 
 validate_params(Params) ->
     #{enum_values := AsEnums, message := Msg} = enum_values(as),
-    case lists:member(get_value(<<"as">>, Params), AsEnums) of
+    case lists:member(proplists:get_value(<<"as">>, Params), AsEnums) of
         true -> {ok, Params};
         false ->
             {error, ?ERROR8, Msg}
@@ -107,33 +101,31 @@ validate_params(Params) ->
 
 pack_banned(Params) ->
     Now = erlang:system_time(second),
-    do_pack_banned(Params, #banned{by = <<"user">>,
-                                   at = Now,
-                                   until = Now + 300}).
+    do_pack_banned(Params, #{by => <<"user">>, at => Now, until => Now + 300}).
 
-do_pack_banned([], Banned) ->
-    {ok, Banned};
+do_pack_banned([], #{who := Who,  by := By, reason := Reason, at := At, until := Until}) ->
+    {ok, #banned{who = Who, by = By, reason = Reason, at = At, until = Until}};
 do_pack_banned([{<<"who">>, Who} | Params], Banned) ->
     case lists:keytake(<<"as">>, 1, Params) of
         {value, {<<"as">>, <<"peerhost">>}, Params2} ->
             {ok, IPAddress} = inet:parse_address(str(Who)),
-            do_pack_banned(Params2, Banned#banned{who = {peerhost, IPAddress}});
+            do_pack_banned(Params2, Banned#{who => {peerhost, IPAddress}});
         {value, {<<"as">>, <<"clientid">>}, Params2} ->
-            do_pack_banned(Params2, Banned#banned{who = {clientid, Who}});
+            do_pack_banned(Params2, Banned#{who => {clientid, Who}});
         {value, {<<"as">>, <<"username">>}, Params2} ->
-            do_pack_banned(Params2, Banned#banned{who = {username, Who}})
+            do_pack_banned(Params2, Banned#{who => {username, Who}})
     end;
 do_pack_banned([P1 = {<<"as">>, _}, P2 | Params], Banned) ->
     do_pack_banned([P2, P1 | Params], Banned);
 do_pack_banned([{<<"by">>, By} | Params], Banned) ->
-    do_pack_banned(Params, Banned#banned{by = By});
+    do_pack_banned(Params, Banned#{by => By});
 do_pack_banned([{<<"reason">>, Reason} | Params], Banned) ->
-    do_pack_banned(Params, Banned#banned{reason = Reason});
+    do_pack_banned(Params, Banned#{reason => Reason});
 do_pack_banned([{<<"at">>, At} | Params], Banned) ->
-    do_pack_banned(Params, Banned#banned{at = At});
+    do_pack_banned(Params, Banned#{at => At});
 do_pack_banned([{<<"until">>, Until} | Params], Banned) ->
-    do_pack_banned(Params, Banned#banned{until = Until});
-do_pack_banned([_P | Params], Banned) -> %% ingore other params
+    do_pack_banned(Params, Banned#{until => Until});
+do_pack_banned([_P | Params], Banned) -> %% ignore other params
     do_pack_banned(Params, Banned).
 
 do_delete(<<"peerhost">>, Who) ->

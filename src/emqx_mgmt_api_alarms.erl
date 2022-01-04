@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -111,7 +111,7 @@ deactivate(_Bindings, Params) ->
     do_deactivate(Node, Name).
 
 delete_deactivated(Bindings, _Params) when map_size(Bindings) == 0 ->
-    emqx_mgmt:delete_all_deactivated_alarms(),
+    _ = emqx_mgmt:delete_all_deactivated_alarms(),
     {ok, #{code => ?SUCCESS}};
 
 delete_deactivated(#{node := Node}, _Params) ->

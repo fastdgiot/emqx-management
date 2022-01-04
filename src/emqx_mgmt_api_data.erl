@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,10 +21,6 @@
 -include_lib("kernel/include/file.hrl").
 
 -include("emqx_mgmt.hrl").
-
--import(minirest, [ return/0
-                  , return/1
-                  ]).
 
 -rest_api(#{name   => export,
             method => 'POST',
@@ -75,58 +71,16 @@
         ]).
 
 export(_Bindings, _Params) ->
-    Rules = emqx_mgmt:export_rules(),
-    Resources = emqx_mgmt:export_resources(),
-    Blacklist = emqx_mgmt:export_blacklist(),
-    Apps = emqx_mgmt:export_applications(),
-    Users = emqx_mgmt:export_users(),
-    AuthClientid = emqx_mgmt:export_auth_clientid(),
-    AuthUsername = emqx_mgmt:export_auth_username(),
-    AuthMnesia = emqx_mgmt:export_auth_mnesia(),
-    AclMnesia = emqx_mgmt:export_acl_mnesia(),
-    Schemas = emqx_mgmt:export_schemas(),
-    Seconds = erlang:system_time(second),
-    {{Y, M, D}, {H, MM, S}} = emqx_mgmt_util:datetime(Seconds),
-    Filename = io_lib:format("emqx-export-~p-~p-~p-~p-~p-~p.json", [Y, M, D, H, MM, S]),
-    NFilename = filename:join([emqx:get_env(data_dir), Filename]),
-    Version = emqx_sys:version(),
-    Data = [{version, erlang:list_to_binary(Version)},
-            {date, erlang:list_to_binary(emqx_mgmt_util:strftime(Seconds))},
-            {rules, Rules},
-            {resources, Resources},
-            {blacklist, Blacklist},
-            {apps, Apps},
-            {users, Users},
-            {auth_clientid, AuthClientid},
-            {auth_username, AuthUsername},
-            {auth_mnesia, AuthMnesia},
-            {acl_mnesia, AclMnesia},
-            {schemas, Schemas}
-           ],
-
-    Bin = emqx_json:encode(Data),
-    ok = filelib:ensure_dir(NFilename),
-    case file:write_file(NFilename, Bin) of
-        ok ->
-            case file:read_file_info(NFilename) of
-                {ok, #file_info{size = Size, ctime = {{Y, M, D}, {H, MM, S}}}} ->
-                    CreatedAt = io_lib:format("~p-~p-~p ~p:~p:~p", [Y, M, D, H, MM, S]),
-                    return({ok, [{filename, list_to_binary(Filename)},
-                                 {size, Size},
-                                 {created_at, list_to_binary(CreatedAt)},
-                                 {node, node()}
-                                ]});
-                {error, Reason} ->
-                    return({error, Reason})
-            end;
-        {error, Reason} ->
-            return({error, Reason})
+    case emqx_mgmt_data_backup:export() of
+        {ok, File = #{filename := Filename}} ->
+            minirest:return({ok, File#{filename => filename:basename(Filename)}});
+        Return -> minirest:return(Return)
     end.
 
 list_exported(_Bindings, _Params) ->
     List = [ rpc:call(Node, ?MODULE, get_list_exported, []) || Node <- ekka_mnesia:running_nodes() ],
     NList = lists:map(fun({_, FileInfo}) -> FileInfo end, lists:keysort(1, lists:append(List))),
-    return({ok, NList}).
+    minirest:return({ok, NList}).
 
 get_list_exported() ->
     Dir = emqx:get_env(data_dir),
@@ -156,64 +110,35 @@ get_list_exported() ->
 import(_Bindings, Params) ->
     case proplists:get_value(<<"filename">>, Params) of
         undefined ->
-            return({error, missing_required_params});
+            Result = import_content(Params),
+            minirest:return(Result);
         Filename ->
-            Result = case proplists:get_value(<<"node">>, Params) of
-                undefined -> do_import(Filename);
+            case proplists:get_value(<<"node">>, Params) of
+                undefined ->
+                    Result = do_import(Filename),
+                    minirest:return(Result);
                 Node ->
                     case lists:member(Node,
                           [ erlang:atom_to_binary(N, utf8) || N <- ekka_mnesia:running_nodes() ]
                          ) of
-                        true -> rpc:call(erlang:binary_to_atom(Node, utf8), ?MODULE, do_import, [Filename]);
-                        false -> return({error, no_existent_node})
+                        true -> minirest:return(rpc:call(erlang:binary_to_atom(Node, utf8), ?MODULE, do_import, [Filename]));
+                        false -> minirest:return({error, no_existent_node})
                     end
-            end,
-            return(Result)
+            end
     end.
 
 do_import(Filename) ->
-    FullFilename = filename:join([emqx:get_env(data_dir), Filename]),
-    case file:read_file(FullFilename) of
-        {ok, Json} ->
-            Data = emqx_json:decode(Json, [return_maps]),
-            Version = emqx_mgmt:to_version(maps:get(<<"version">>, Data)),
-            case emqx_mgmt:is_version_supported(Data, Version) of
-                true  ->
-                    try
-                        emqx_mgmt:import_confs(maps:get(<<"configs">>, Data, []), maps:get(<<"listeners_state">>, Data, [])),
-                        emqx_mgmt:import_resources(maps:get(<<"resources">>, Data, [])),
-                        emqx_mgmt:import_rules(maps:get(<<"rules">>, Data, [])),
-                        emqx_mgmt:import_blacklist(maps:get(<<"blacklist">>, Data, [])),
-                        emqx_mgmt:import_applications(maps:get(<<"apps">>, Data, [])),
-                        emqx_mgmt:import_users(maps:get(<<"users">>, Data, [])),
-                        emqx_mgmt:import_modules(maps:get(<<"modules">>, Data, [])),
-                        emqx_mgmt:import_auth_clientid(maps:get(<<"auth_clientid">>, Data, [])),
-                        emqx_mgmt:import_auth_username(maps:get(<<"auth_username">>, Data, [])),
-                        emqx_mgmt:import_auth_mnesia(maps:get(<<"auth_mnesia">>, Data, []), Version),
-                        emqx_mgmt:import_acl_mnesia(maps:get(<<"acl_mnesia">>, Data, []), Version),
-                        emqx_mgmt:import_schemas(maps:get(<<"schemas">>, Data, [])),
-                        logger:debug("The emqx data has been imported successfully"),
-                        ok
-                    catch Class:Reason:Stack ->
-                        logger:error("The emqx data import failed: ~0p", [{Class,Reason,Stack}]),
-                        {error, import_failed}
-                    end;
-                false ->
-                    logger:error("Unsupported version: ~p", [Version]),
-                    {error, unsupported_version}
-            end;
-        {error, Reason} ->
-            {error, Reason}
-    end.
+    FullFilename = fullname(Filename),
+    emqx_mgmt_data_backup:import(FullFilename, "{}").
 
 download(#{filename := Filename}, _Params) ->
-    FullFilename = filename:join([emqx:get_env(data_dir), Filename]),
+    FullFilename = fullname(Filename),
     case file:read_file(FullFilename) of
         {ok, Bin} ->
             {ok, #{filename => list_to_binary(Filename),
                    file => Bin}};
         {error, Reason} ->
-            return({error, Reason})
+            minirest:return({error, Reason})
     end.
 
 upload(Bindings, Params) ->
@@ -221,26 +146,41 @@ upload(Bindings, Params) ->
 
 do_upload(_Bindings, #{<<"filename">> := Filename,
                        <<"file">> := Bin}) ->
-    FullFilename = filename:join([emqx:get_env(data_dir), Filename]),
+    FullFilename = fullname(Filename),
     case file:write_file(FullFilename, Bin) of
         ok ->
-            return({ok, [{node, node()}]});
+            minirest:return({ok, [{node, node()}]});
         {error, Reason} ->
-            return({error, Reason})
+            minirest:return({error, Reason})
     end;
 do_upload(Bindings, Params = #{<<"file">> := _}) ->
-    Seconds = erlang:system_time(second),
-    {{Y, M, D}, {H, MM, S}} = emqx_mgmt_util:datetime(Seconds),
-    Filename = io_lib:format("emqx-export-~p-~p-~p-~p-~p-~p.json", [Y, M, D, H, MM, S]),
-    do_upload(Bindings, Params#{<<"filename">> => Filename});
+    do_upload(Bindings, Params#{<<"filename">> => tmp_filename()});
 do_upload(_Bindings, _Params) ->
-    return({error, missing_required_params}).
+    minirest:return({error, missing_required_params}).
 
 delete(#{filename := Filename}, _Params) ->
-    FullFilename = filename:join([emqx:get_env(data_dir), Filename]),
+    FullFilename = fullname(Filename),
     case file:delete(FullFilename) of
         ok ->
-            return();
+            minirest:return();
         {error, Reason} ->
-            return({error, Reason})
+            minirest:return({error, Reason})
     end.
+
+import_content(Content) ->
+    File = dump_to_tmp_file(Content),
+    do_import(File).
+
+dump_to_tmp_file(Content) ->
+    Bin = emqx_json:encode(Content),
+    Filename = tmp_filename(),
+    ok = file:write_file(fullname(Filename), Bin),
+    Filename.
+
+fullname(Name) ->
+    filename:join(emqx:get_env(data_dir), Name).
+
+tmp_filename() ->
+    Seconds = erlang:system_time(second),
+    {{Y, M, D}, {H, MM, S}} = emqx_mgmt_util:datetime(Seconds),
+    io_lib:format("emqx-export-~p-~p-~p-~p-~p-~p.json", [Y, M, D, H, MM, S]).

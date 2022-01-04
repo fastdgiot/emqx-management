@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -85,7 +85,7 @@ add_app(AppId, Name) when is_binary(AppId) ->
 add_app(AppId, Name, Desc, Status, Expired) when is_binary(AppId) ->
     add_app(AppId, Name, undefined, Desc, Status, Expired).
 
--spec(add_app(appid(), binary(), binary(), binary(), boolean(), integer() | undefined)
+-spec(add_app(appid(), binary(), binary() | undefined, binary(), boolean(), integer() | undefined)
       -> {ok, appsecret()}
        | {error, term()}).
 add_app(AppId, Name, Secret, Desc, Status, Expired) when is_binary(AppId) ->
@@ -138,7 +138,7 @@ get_appsecret(AppId) when is_binary(AppId) ->
         [] -> undefined
     end.
 
--spec(lookup_app(appid()) -> {{appid(), appsecret(), binary(), binary(), boolean(), integer() | undefined} | undefined}).
+-spec(lookup_app(appid()) -> undefined | {appid(), appsecret(), binary(), binary(), boolean(), integer() | undefined}).
 lookup_app(AppId) when is_binary(AppId) ->
     case mnesia:dirty_read(mqtt_app, AppId) of
         [#mqtt_app{id = AppId,
