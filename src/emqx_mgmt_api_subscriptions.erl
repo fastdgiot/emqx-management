@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -64,8 +64,11 @@ list(Bindings, Params) when map_size(Bindings) == 0 ->
     case proplists:get_value(<<"topic">>, Params) of
         undefined ->
             minirest:return({ok, emqx_mgmt_api:cluster_query(Params, ?SUBS_QS_SCHEMA, ?query_fun)});
-        Topic ->
-            minirest:return({ok, emqx_mgmt:list_subscriptions_via_topic(emqx_mgmt_util:urldecode(Topic), ?format_fun)})
+        Topic0 ->
+            Topic = emqx_mgmt_util:urldecode(Topic0),
+            Data = emqx_mgmt:list_subscriptions_via_topic(Topic, ?format_fun),
+            FilterData = filter_subscriptions(Data, Params),
+            minirest:return({ok, add_meta(Params, FilterData)})
     end;
 
 list(#{node := Node} = Bindings, Params) ->
@@ -80,15 +83,33 @@ list(#{node := Node} = Bindings, Params) ->
                         Res -> Res
                     end
             end;
-        Topic ->
-            minirest:return({ok, emqx_mgmt:list_subscriptions_via_topic(Node, emqx_mgmt_util:urldecode(Topic), ?format_fun)})
+        Topic0 ->
+            Topic = emqx_mgmt_util:urldecode(Topic0),
+            Data = emqx_mgmt:list_subscriptions_via_topic(Node, Topic, ?format_fun),
+            FilterData = filter_subscriptions(Data, Params),
+            minirest:return({ok, add_meta(Params, FilterData)})
     end.
 
+add_meta(Params, List) ->
+    Page = emqx_mgmt_api:page(Params),
+    Limit = emqx_mgmt_api:limit(Params),
+    Count = erlang:length(List),
+    Start = (Page - 1) * Limit + 1,
+    Data = lists:sublist(List, Start, Limit),
+    #{meta => #{
+        page => Page,
+        limit => Limit,
+        hasnext => Start + Limit - 1 < Count,
+        count => Count},
+        data => Data,
+        code => 0
+    }.
+
 lookup(#{node := Node, clientid := ClientId}, _Params) ->
-    minirest:return({ok, format(emqx_mgmt:lookup_subscriptions(Node, emqx_mgmt_util:urldecode(ClientId)))});
+    minirest:return({ok, emqx_mgmt:lookup_subscriptions(Node, emqx_mgmt_util:urldecode(ClientId), ?format_fun)});
 
 lookup(#{clientid := ClientId}, _Params) ->
-    minirest:return({ok, format(emqx_mgmt:lookup_subscriptions(emqx_mgmt_util:urldecode(ClientId)))}).
+    minirest:return({ok, emqx_mgmt:lookup_subscriptions(emqx_mgmt_util:urldecode(ClientId), ?format_fun)}).
 
 format(Items) when is_list(Items) ->
     [format(Item) || Item <- Items];
@@ -101,7 +122,7 @@ format({_Subscriber, Topic, Options = #{share := Group}}) ->
     #{node => node(), topic => filename:join([<<"$share">>, Group, Topic]), clientid => maps:get(subid, Options), qos => QoS};
 format({_Subscriber, Topic, Options}) ->
     QoS = maps:get(qos, Options),
-    #{node => node(), topic => Topic, clientid => maps:get(subid, Options), qos => QoS}.
+    #{node => node(), topic => Topic, clientid => maps:get(subid, Options, ""), qos => QoS}.
 
 %%--------------------------------------------------------------------
 %% Query Function
@@ -150,3 +171,30 @@ update_ms(share, X, {{Pid, Topic}, Opts}) ->
     {{Pid, Topic}, Opts#{share => X}};
 update_ms(qos, X, {{Pid, Topic}, Opts}) ->
     {{Pid, Topic}, Opts#{qos => X}}.
+
+filter_subscriptions(Data0, Params) ->
+    Data1 = filter_by_key(qos, qos(Params), Data0),
+    Data2 = filter_by_key(clientid, proplists:get_value(<<"clientid">>, Params), Data1),
+    case proplists:get_value(<<"share">>, Params) of
+        undefined -> Data2;
+        Share ->
+            Prefix = filename:join([<<"$share">>, Share]),
+            Size = byte_size(Prefix),
+            lists:filter(fun(#{topic := Topic}) ->
+                case Topic of
+                    <<Prefix:Size/binary, _/binary>> -> true;
+                    _ -> false
+                end
+                         end,
+                Data2)
+    end.
+
+qos(Params) ->
+    case proplists:get_value(<<"qos">>, Params) of
+        undefined -> undefined;
+        Qos when is_integer(Qos) -> Qos;
+        Qos when is_binary(Qos) -> binary_to_integer(Qos)
+    end.
+
+filter_by_key(_Key, undefined, List) -> List;
+filter_by_key(Key, Value, List) -> lists:filter(fun(E) -> Value =:= maps:get(Key, E) end, List).

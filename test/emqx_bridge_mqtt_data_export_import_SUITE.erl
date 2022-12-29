@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -28,20 +28,31 @@ all() ->
     emqx_ct:all(?MODULE).
 
 init_per_suite(Cfg) ->
+    ekka_mnesia:start(),
+    ok = emqx_dashboard_admin:mnesia(boot),
     application:load(emqx_modules),
     application:load(emqx_bridge_mqtt),
+    ekka_mnesia:start(),
+    emqx_dashboard_admin:mnesia(boot),
     emqx_ct_helpers:start_apps([emqx_rule_engine, emqx_management]),
+    application:ensure_all_started(emqx_dashboard),
+    ok = emqx_rule_engine:load_providers(),
     Cfg.
 
 end_per_suite(Cfg) ->
+    emqx_mgmt_data_backup:delete_all_backup_file(),
+    application:stop(emqx_dashboard),
     emqx_ct_helpers:stop_apps([emqx_management, emqx_rule_engine]),
     Cfg.
 
 get_data_path() ->
     emqx_ct_helpers:deps_path(emqx_management, "test/emqx_bridge_mqtt_data_export_import_SUITE_data/").
 
-import(FilePath, Version) ->
-    ok = emqx_mgmt_data_backup:import(get_data_path() ++ "/" ++ FilePath, <<"{}">>),
+import(FilePath0, Version) ->
+    Filename = filename:basename(FilePath0),
+    FilePath = filename:join([get_data_path(), FilePath0]),
+    {ok, Bin} = file:read_file(FilePath),
+    ok = emqx_mgmt_data_backup:upload_backup_file(Filename, Bin),
     timer:sleep(500),
     lists:foreach(fun(#resource{id = Id, config = Config} = _Resource) ->
         case Id of

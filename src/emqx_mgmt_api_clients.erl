@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -35,6 +35,10 @@
          {<<"_gte_created_at">>, timestamp},
          {<<"_lte_created_at">>, timestamp},
          {<<"_gte_connected_at">>, timestamp},
+         {<<"_gte_mqueue_len">>, integer},
+         {<<"_lte_mqueue_len">>, integer},
+         {<<"_gte_mqueue_dropped">>, integer},
+         {<<"_lte_mqueue_dropped">>, integer},
          {<<"_lte_connected_at">>, timestamp}]}).
 
 -rest_api(#{name   => list_clients,
@@ -117,6 +121,12 @@
             func   => clean_quota,
             descr  => "Clear the quota policy"}).
 
+-rest_api(#{name   => set_keepalive,
+            method => 'PUT',
+            path   => "/clients/:bin:clientid/keepalive",
+            func   => set_keepalive,
+            descr  => "Set the client keepalive"}).
+
 -import(emqx_mgmt_util, [ ntoa/1
                         , strftime/1
                         ]).
@@ -130,23 +140,24 @@
         , set_quota_policy/2
         , clean_ratelimit/2
         , clean_quota/2
+        , set_keepalive/2
         ]).
 
 -export([ query/3
         , format_channel_info/1
         ]).
 
--define(query_fun, {?MODULE, query}).
--define(format_fun, {?MODULE, format_channel_info}).
+-define(QUERY_FUN, {?MODULE, query}).
+-define(FORMAT_FUN, {?MODULE, format_channel_info}).
 
 list(Bindings, Params) when map_size(Bindings) == 0 ->
     fence(fun() ->
-        emqx_mgmt_api:cluster_query(Params, ?CLIENT_QS_SCHEMA, ?query_fun)
+        emqx_mgmt_api:cluster_query(Params, ?CLIENT_QS_SCHEMA, ?QUERY_FUN)
     end);
 
 list(#{node := Node}, Params) when Node =:= node() ->
     fence(fun() ->
-        emqx_mgmt_api:node_query(Node, Params, ?CLIENT_QS_SCHEMA, ?query_fun)
+        emqx_mgmt_api:node_query(Node, Params, ?CLIENT_QS_SCHEMA, ?QUERY_FUN)
     end);
 
 list(Bindings = #{node := Node}, Params) ->
@@ -169,16 +180,20 @@ fence(Func) ->
     end.
 
 lookup(#{node := Node, clientid := ClientId}, _Params) ->
-    minirest:return({ok, emqx_mgmt:lookup_client(Node, {clientid, emqx_mgmt_util:urldecode(ClientId)}, ?format_fun)});
+    minirest:return({ok, emqx_mgmt:lookup_client(Node,
+        {clientid, emqx_mgmt_util:urldecode(ClientId)}, ?FORMAT_FUN)});
 
 lookup(#{clientid := ClientId}, _Params) ->
-    minirest:return({ok, emqx_mgmt:lookup_client({clientid, emqx_mgmt_util:urldecode(ClientId)}, ?format_fun)});
+    minirest:return({ok, emqx_mgmt:lookup_client(
+        {clientid, emqx_mgmt_util:urldecode(ClientId)}, ?FORMAT_FUN)});
 
 lookup(#{node := Node, username := Username}, _Params) ->
-    minirest:return({ok, emqx_mgmt:lookup_client(Node, {username, emqx_mgmt_util:urldecode(Username)}, ?format_fun)});
+    minirest:return({ok, emqx_mgmt:lookup_client(Node,
+        {username, emqx_mgmt_util:urldecode(Username)}, ?FORMAT_FUN)});
 
 lookup(#{username := Username}, _Params) ->
-    minirest:return({ok, emqx_mgmt:lookup_client({username, emqx_mgmt_util:urldecode(Username)}, ?format_fun)}).
+    minirest:return({ok, emqx_mgmt:lookup_client({username,
+        emqx_mgmt_util:urldecode(Username)}, ?FORMAT_FUN)}).
 
 kickout(#{clientid := ClientId}, _Params) ->
     case emqx_mgmt:kickout_client(emqx_mgmt_util:urldecode(ClientId)) of
@@ -204,7 +219,7 @@ list_acl_cache(#{clientid := ClientId}, _Params) ->
 set_ratelimit_policy(#{clientid := ClientId}, Params) ->
     P = [{conn_bytes_in, proplists:get_value(<<"conn_bytes_in">>, Params)},
          {conn_messages_in, proplists:get_value(<<"conn_messages_in">>, Params)}],
-    case [{K, parse_ratelimit_str(V)} || {K, V} <- P, V =/= undefined] of
+    case filter_ratelimit_params(P) of
         [] -> minirest:return();
         Policy ->
             case emqx_mgmt:set_ratelimit_policy(emqx_mgmt_util:urldecode(ClientId), Policy) of
@@ -223,7 +238,7 @@ clean_ratelimit(#{clientid := ClientId}, _Params) ->
 
 set_quota_policy(#{clientid := ClientId}, Params) ->
     P = [{conn_messages_routing, proplists:get_value(<<"conn_messages_routing">>, Params)}],
-    case [{K, parse_ratelimit_str(V)} || {K, V} <- P, V =/= undefined] of
+    case filter_ratelimit_params(P) of
         [] -> minirest:return();
         Policy ->
             case emqx_mgmt:set_quota_policy(emqx_mgmt_util:urldecode(ClientId), Policy) of
@@ -233,12 +248,30 @@ set_quota_policy(#{clientid := ClientId}, Params) ->
             end
     end.
 
+
 clean_quota(#{clientid := ClientId}, _Params) ->
     case emqx_mgmt:set_quota_policy(emqx_mgmt_util:urldecode(ClientId), []) of
         ok -> minirest:return();
         {error, not_found} -> minirest:return({error, ?ERROR12, not_found});
         {error, Reason} -> minirest:return({error, ?ERROR1, Reason})
     end.
+
+set_keepalive(#{clientid := ClientId}, Params) ->
+    case proplists:get_value(<<"interval">>, Params) of
+        undefined ->
+            minirest:return({error, ?ERROR7, params_not_found});
+        Interval0 ->
+            Interval = to_integer(Interval0),
+            case emqx_mgmt:set_keepalive(emqx_mgmt_util:urldecode(ClientId), Interval) of
+                ok -> minirest:return();
+                {error, not_found} -> minirest:return({error, ?ERROR12, not_found});
+                {error, Code, Reason} -> minirest:return({error, Code, Reason});
+                {error, Reason} -> minirest:return({error, ?ERROR1, Reason})
+            end
+    end.
+
+to_integer(Int)when is_integer(Int) -> Int;
+to_integer(Bin) when is_binary(Bin) -> binary_to_integer(Bin).
 
 %% @private
 %% S = 100,1s
@@ -266,11 +299,12 @@ format_channel_info({_Key, Info, Stats0}) ->
     ConnInfo = maps:get(conninfo, Info, #{}),
     Session = case maps:get(session, Info, #{}) of
                   undefined -> #{};
-                  _Sess -> _Sess
+                  Sess -> Sess
               end,
     SessCreated = maps:get(created_at, Session, maps:get(connected_at, ConnInfo)),
     Connected = case maps:get(conn_state, Info, connected) of
                     connected -> true;
+                    accepted -> true;  %% for exproto anonymous clients
                     _ -> false
                 end,
     NStats = Stats#{max_subscriptions => maps:get(subscriptions_max, Stats, 0),
@@ -287,8 +321,14 @@ format_channel_info({_Key, Info, Stats0}) ->
                              inflight, max_inflight, awaiting_rel,
                              max_awaiting_rel, mqueue_len, mqueue_dropped,
                              max_mqueue, heap_size, reductions, mailbox_len,
-                             recv_cnt, recv_msg, recv_oct, recv_pkt, send_cnt,
-                             send_msg, send_oct, send_pkt], NStats),
+                             recv_cnt,
+                             recv_msg, 'recv_msg.qos0', 'recv_msg.qos1', 'recv_msg.qos2',
+                            'recv_msg.dropped', 'recv_msg.dropped.expired',
+                             recv_oct, recv_pkt, send_cnt,
+                             send_msg, 'send_msg.qos0', 'send_msg.qos1', 'send_msg.qos2',
+                            'send_msg.dropped', 'send_msg.dropped.expired',
+                            'send_msg.dropped.queue_full', 'send_msg.dropped.too_large',
+                             send_oct, send_pkt], NStats),
                  maps:with([clientid, username, mountpoint, is_bridge, zone], ClientInfo),
                  maps:with([clean_start, keepalive, expiry_interval, proto_name,
                             proto_ver, peername, connected_at, disconnected_at], ConnInfo),
@@ -306,7 +346,8 @@ format(Data) when is_map(Data)->
                       created_at   => iolist_to_binary(strftime(CreatedAt div 1000))},
                case maps:get(disconnected_at, Data, undefined) of
                    undefined -> #{};
-                   DisconnectedAt -> #{disconnected_at => iolist_to_binary(strftime(DisconnectedAt div 1000))}
+                   DisconnectedAt -> #{disconnected_at =>
+                                       iolist_to_binary(strftime(DisconnectedAt div 1000))}
                end).
 
 format_acl_cache({{PubSub, Topic}, {AclResult, Timestamp}}) ->
@@ -319,65 +360,79 @@ format_acl_cache({{PubSub, Topic}, {AclResult, Timestamp}}) ->
 %% Query Functions
 %%--------------------------------------------------------------------
 
-query({Qs, []}, Start, Limit) ->
-    Ms = qs2ms(Qs),
-    emqx_mgmt_api:select_table(emqx_channel_info, Ms, Start, Limit, fun format_channel_info/1);
-
 query({Qs, Fuzzy}, Start, Limit) ->
-    Ms = qs2ms(Qs),
-    MatchFun = match_fun(Ms, Fuzzy),
-    emqx_mgmt_api:traverse_table(emqx_channel_info, MatchFun, Start, Limit, fun format_channel_info/1).
+    case qs2ms(Qs) of
+        {Ms, []} when Fuzzy =:= [] ->
+            emqx_mgmt_api:select_table(emqx_channel_info, Ms, Start, Limit, fun format_channel_info/1);
+        {Ms, FuzzyStats} ->
+            MatchFun = match_fun(Ms, Fuzzy ++ FuzzyStats),
+            emqx_mgmt_api:traverse_table(emqx_channel_info, MatchFun, Start, Limit, fun format_channel_info/1)
+    end.
 
 %%--------------------------------------------------------------------
 %% Match funcs
 
 match_fun(Ms, Fuzzy) ->
     MsC = ets:match_spec_compile(Ms),
-    REFuzzy = lists:map(fun({K, like, S}) ->
-                  {ok, RE} = re:compile(escape(S)),
-                  {K, like, RE}
-              end, Fuzzy),
     fun(Rows) ->
          case ets:match_spec_run(Rows, MsC) of
              [] -> [];
              Ls ->
                  lists:filter(fun(E) ->
-                    run_fuzzy_match(E, REFuzzy)
+                    run_fuzzy_match(E, Fuzzy)
                  end, Ls)
          end
     end.
 
-escape(B) when is_binary(B) ->
-    re:replace(B, <<"\\\\">>, <<"\\\\\\\\">>, [{return, binary}, global]).
-
 run_fuzzy_match(_, []) ->
     true;
-run_fuzzy_match(E = {_, #{clientinfo := ClientInfo}, _}, [{Key, _, RE}|Fuzzy]) ->
-    Val = case maps:get(Key, ClientInfo, "") of
-              undefined -> "";
+run_fuzzy_match(E = {_, #{clientinfo := ClientInfo}, _}, [{Key, like, SubStr} | Fuzzy]) ->
+    Val = case maps:get(Key, ClientInfo, undefined) of
+              undefined -> <<>>;
               V -> V
           end,
-    re:run(Val, RE, [{capture, none}]) == match andalso run_fuzzy_match(E, Fuzzy).
+    binary:match(Val, SubStr) /= nomatch andalso run_fuzzy_match(E, Fuzzy);
+run_fuzzy_match(E = {_, _, Stats}, [{Key, '>=', Int}|Fuzzy]) ->
+    case lists:keyfind(Key, 1, Stats) of
+        {_, Val} when Val >= Int -> run_fuzzy_match(E, Fuzzy);
+        _ -> false
+    end;
+run_fuzzy_match(E = {_, _, Stats}, [{Key, '=<', Int}|Fuzzy]) ->
+    case lists:keyfind(Key, 1, Stats) of
+        {_, Val} when Val =< Int -> run_fuzzy_match(E, Fuzzy);
+        _ -> false
+    end.
 
 %%--------------------------------------------------------------------
 %% QueryString to Match Spec
 
--spec qs2ms(list()) -> ets:match_spec().
+-spec qs2ms(list()) -> {ets:match_spec(), [{_Key, _Symbol, _Val}]}.
 qs2ms(Qs) ->
-    {MtchHead, Conds} = qs2ms(Qs, 2, {#{}, []}),
-    [{{'$1', MtchHead, '_'}, Conds, ['$_']}].
+    {MatchHead, Conds, FuzzyStats} = qs2ms(Qs, 2, #{}, [], []),
+    {[{{'$1', MatchHead, '_'}, Conds, ['$_']}], FuzzyStats}.
 
-qs2ms([], _, {MtchHead, Conds}) ->
-    {MtchHead, lists:reverse(Conds)};
+qs2ms([], _, MatchHead, Conds, FuzzyStats) ->
+    {MatchHead, lists:reverse(Conds), FuzzyStats};
 
-qs2ms([{Key, '=:=', Value} | Rest], N, {MtchHead, Conds}) ->
-    NMtchHead = emqx_mgmt_util:merge_maps(MtchHead, ms(Key, Value)),
-    qs2ms(Rest, N, {NMtchHead, Conds});
-qs2ms([Qs | Rest], N, {MtchHead, Conds}) ->
+qs2ms([{Key, '=:=', Value} | Rest], N, MatchHead, Conds, FuzzyStats) ->
+    NMatchHead = emqx_mgmt_util:merge_maps(MatchHead, ms(Key, Value)),
+    qs2ms(Rest, N, NMatchHead, Conds, FuzzyStats);
+qs2ms([Qs | Rest], N, MatchHead, Conds, FuzzyStats) ->
     Holder = binary_to_atom(iolist_to_binary(["$", integer_to_list(N)]), utf8),
-    NMtchHead = emqx_mgmt_util:merge_maps(MtchHead, ms(element(1, Qs), Holder)),
-    NConds = put_conds(Qs, Holder, Conds),
-    qs2ms(Rest, N+1, {NMtchHead, NConds}).
+    case ms(element(1, Qs), Holder) of
+        fuzzy_stats ->
+            FuzzyStats1 =
+                case Qs of
+                    {_Key, _Symbol, _Val} -> [Qs | FuzzyStats];
+                    {Key, Symbol1, Val1, Symbol2, Val2} ->
+                        [{Key, Symbol1, Val1}, {Key, Symbol2, Val2} | FuzzyStats]
+                end,
+            qs2ms(Rest, N, MatchHead, Conds, FuzzyStats1);
+        Ms ->
+            NMatchHead = emqx_mgmt_util:merge_maps(MatchHead, Ms),
+            NConds = put_conds(Qs, Holder, Conds),
+            qs2ms(Rest, N+1, NMatchHead, NConds, FuzzyStats)
+    end.
 
 put_conds({_, Op, V}, Holder, Conds) ->
     [{Op, Holder, V} | Conds];
@@ -404,7 +459,14 @@ ms(proto_ver, X) ->
 ms(connected_at, X) ->
     #{conninfo => #{connected_at => X}};
 ms(created_at, X) ->
-    #{session => #{created_at => X}}.
+    #{session => #{created_at => X}};
+ms(mqueue_len, _X) ->
+    fuzzy_stats;
+ms(mqueue_dropped, _X) ->
+    fuzzy_stats.
+
+filter_ratelimit_params(P) ->
+    [{K, parse_ratelimit_str(V)} || {K, V} <- P, V =/= undefined].
 
 %%--------------------------------------------------------------------
 %% EUnits
@@ -427,6 +489,10 @@ params2qs_test() ->
               {<<"_lte_created_at">>, 5},
               {<<"_gte_connected_at">>, 1},
               {<<"_lte_connected_at">>, 5},
+              {<<"_lte_mqueue_len">>, 10},
+              {<<"_gte_mqueue_len">>, 5},
+              {<<"_lte_mqueue_dropped">>, 100},
+              {<<"_gte_mqueue_dropped">>, 50},
               {<<"_like_clientid">>, <<"a">>},
               {<<"_like_username">>, <<"e">>}
              ],
@@ -442,20 +508,67 @@ params2qs_test() ->
                         proto_ver => 4,
                         connected_at => '$3'},
           session => #{created_at => '$2'}},
-    ExpectedCondi = [{'>=','$2', 1},
-                     {'=<','$2', 5},
-                     {'>=','$3', 1},
-                     {'=<','$3', 5}],
-    {10, {Qs1, []}} = emqx_mgmt_api:params2qs(Params, QsSchema),
-    [{{'$1', MtchHead, _}, Condi, _}] = qs2ms(Qs1),
+    ExpectedCondi = [{'>=','$2', 1000},
+                     {'=<','$2', 5000},
+                     {'>=','$3', 1000},
+                     {'=<','$3', 5000}],
+    ExpectedFuzzyStats = [{mqueue_dropped,'=<',100},
+                          {mqueue_dropped,'>=',50},
+                          {mqueue_len,'=<',10},
+                          {mqueue_len,'>=',5}],
+    {12, {Qs1, []}} = emqx_mgmt_api:params2qs(Params, QsSchema),
+    {[{{'$1', MtchHead, _}, Condi, _}], FuzzyStats} = qs2ms(Qs1),
     ?assertEqual(ExpectedMtchHead, MtchHead),
     ?assertEqual(ExpectedCondi, Condi),
+    ?assertEqual(ExpectedFuzzyStats, lists:sort(FuzzyStats)),
 
-    [{{'$1', #{}, '_'}, [], ['$_']}] = qs2ms([]).
+    {[{{'$1', #{}, '_'}, [], ['$_']}], []} = qs2ms([]).
 
-escape_test() ->
-    Str = <<"\\n">>,
-    {ok, Re} = re:compile(escape(Str)),
-    {match, _} = re:run(<<"\\name">>, Re).
+fuzzy_match_test() ->
+    Info = {emqx_channel_info,
+            #{clientinfo =>
+              #{ clientid => <<"abcde">>
+               , username => <<"abc\\name*[]()">>
+               }}, []
+           },
+    true = run_fuzzy_match(Info, [{clientid, like, <<"abcde">>}]),
+    true = run_fuzzy_match(Info, [{clientid, like, <<"bcd">>}]),
+    false = run_fuzzy_match(Info, [{clientid, like, <<"defh">>}]),
+
+    true = run_fuzzy_match(Info, [{username, like, <<"\\name">>}]),
+    true = run_fuzzy_match(Info, [{username, like, <<"*">>}]),
+    true = run_fuzzy_match(Info, [{username, like, <<"[]">>}]),
+    true = run_fuzzy_match(Info, [{username, like, <<"()">>}]),
+    false = run_fuzzy_match(Info, [{username, like, <<"))">>}]),
+
+    true = run_fuzzy_match(Info, [{clientid, like, <<"de">>},
+                                  {username, like, <<"[]">>}]).
+
+fuzzy_stats_test() ->
+    Fun = fun(Len, Dropped) ->
+        {emqx_channel_info,
+            #{clientinfo =>
+            #{ clientid => <<"abcde">>, username => <<"abc\\name*[]()">>}},
+            [{mqueue_len, Len}, {mqueue_max,1000}, {mqueue_dropped, Dropped}]
+        }
+          end,
+    false = run_fuzzy_match(Fun(0, 100), [{mqueue_len, '>=', 1}]),
+    true = run_fuzzy_match(Fun(1, 100), [{mqueue_len, '>=', 1}]),
+    false = run_fuzzy_match(Fun(1, 100), [{mqueue_len, '>=', 2}]),
+    true = run_fuzzy_match(Fun(99, 100), [{mqueue_len, '=<', 100}, {mqueue_len, '>=', 98}]),
+    false = run_fuzzy_match(Fun(99, 100), [{mqueue_len, '=<', 101}, {mqueue_len, '>=', 100}]),
+
+    false = run_fuzzy_match(Fun(1000, 0), [{mqueue_dropped, '>=', 1}]),
+    true = run_fuzzy_match(Fun(1000, 1), [{mqueue_dropped, '>=', 1}]),
+    false = run_fuzzy_match(Fun(1000, 1), [{mqueue_dropped, '>=', 2}]),
+    true = run_fuzzy_match(Fun(1000, 99), [{mqueue_dropped, '=<', 100}, {mqueue_dropped, '>=', 98}]),
+    false = run_fuzzy_match(Fun(1000, 99), [{mqueue_dropped, '=<', 98}, {mqueue_dropped, '>=', 97}]),
+    false = run_fuzzy_match(Fun(1000, 102), [{mqueue_dropped, '=<', 104}, {mqueue_dropped, '>=', 103}]),
+
+    true = run_fuzzy_match(Fun(1000, 103), [{mqueue_dropped, '=<', 104}, {mqueue_dropped, '>=', 103},
+        {mqueue_len, '>=', 1000}]),
+    false = run_fuzzy_match(Fun(1000, 199), [{mqueue_dropped, '>=', 198},
+        {mqueue_len, '=<', 99}, {mqueue_len, '>=', 1}]),
+    ok.
 
 -endif.

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -85,11 +85,14 @@ listeners() ->
     application:get_env(?APP, listeners, []).
 
 listener_name(Proto) ->
+    %% NOTE: this name has referenced by emqx_management.appup.src.
+    %% Please don't change it except you have got how to handle it in hot-upgrade
     list_to_atom(atom_to_list(Proto) ++ ":management").
 
 http_handlers() ->
     Plugins = lists:map(fun(Plugin) -> Plugin#plugin.name end, emqx_plugins:list()),
-    [{"/api/v4", minirest:handler(#{apps   => Plugins ++ [emqx_modules] -- ?EXCEPT_PLUGIN,
+    [{"/api/v4", minirest:handler(#{apps   => (Plugins ++
+                                        [emqx_plugin_libs, emqx_modules]) -- ?EXCEPT_PLUGIN,
                                     except => ?EXCEPT,
                                     filter => fun ?MODULE:filter/1}),
                  [{authorization, fun ?MODULE:authorize_appid/1}]}].
@@ -112,15 +115,28 @@ handle_request(<<"GET">>, <<"/status">>, Req) ->
     end,
     Status = io_lib:format("Node ~s is ~s~nemqx is ~s",
                             [node(), InternalStatus, AppStatus]),
-    cowboy_req:reply(200, #{<<"content-type">> => <<"text/plain">>}, Status, Req);
+    StatusCode = case AppStatus of
+                     running -> 200;
+                     not_running -> 503
+                 end,
+    cowboy_req:reply(StatusCode, #{<<"content-type">> => <<"text/plain">>}, Status, Req);
 
 handle_request(_Method, _Path, Req) ->
     cowboy_req:reply(400, #{<<"content-type">> => <<"text/plain">>}, <<"Not found.">>, Req).
 
 authorize_appid(Req) ->
-    case cowboy_req:parse_header(<<"authorization">>, Req) of
-        {basic, AppId, AppSecret} -> emqx_mgmt_auth:is_authorized(AppId, AppSecret);
-         _  -> false
+    authorize_appid(
+      iolist_to_binary(string:uppercase(cowboy_req:method(Req))),
+      iolist_to_binary(cowboy_req:path(Req)),
+      Req).
+
+authorize_appid(<<"GET">>, <<"/api/v4/emqx_prometheus">>, _Req) ->
+    true;
+authorize_appid(_Method, _Path, Req) ->
+    try
+        {basic, AppId, AppSecret} = cowboy_req:parse_header(<<"authorization">>, Req),
+        emqx_mgmt_auth:is_authorized(AppId, AppSecret)
+    catch _:_ -> false
     end.
 
 -ifdef(EMQX_ENTERPRISE).
@@ -128,6 +144,7 @@ filter(_) ->
     true.
 -else.
 filter(#{app := emqx_modules}) -> true;
+filter(#{app := emqx_plugin_libs}) -> true;
 filter(#{app := App}) ->
     case emqx_plugins:find_plugin(App) of
         false -> false;

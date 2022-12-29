@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -21,6 +21,9 @@
 -include_lib("stdlib/include/qlc.hrl").
 -include_lib("emqx/include/emqx.hrl").
 -include_lib("emqx/include/emqx_mqtt.hrl").
+
+-elvis([{elvis_style, invalid_dynamic_call, #{ignore => [emqx_mgmt]}}]).
+-elvis([{elvis_style, god_modules, #{ignore => [emqx_mgmt]}}]).
 
 %% Nodes and Brokers API
 -export([ list_nodes/0
@@ -49,6 +52,11 @@
         , clean_acl_cache_all/1
         , set_ratelimit_policy/2
         , set_quota_policy/2
+        , set_keepalive/2
+        ]).
+
+-export([ clean_pem_cache/0
+        , clean_pem_cache/1
         ]).
 
 %% Internal funcs
@@ -58,8 +66,8 @@
 -export([ list_subscriptions/1
         , list_subscriptions_via_topic/2
         , list_subscriptions_via_topic/3
-        , lookup_subscriptions/1
         , lookup_subscriptions/2
+        , lookup_subscriptions/3
         ]).
 
 %% Routes
@@ -119,7 +127,6 @@
 -define(MAX_ROW_LIMIT, 10000).
 
 -define(APP, emqx_management).
-
 %%--------------------------------------------------------------------
 %% Node Info
 %%--------------------------------------------------------------------
@@ -133,16 +140,17 @@ list_nodes() ->
 lookup_node(Node) -> node_info(Node).
 
 node_info(Node) when Node =:= node() ->
-    Memory  = emqx_vm:get_memory(),
+    {UsedRatio, Total} = get_sys_memory(),
     Info = maps:from_list([{K, list_to_binary(V)} || {K, V} <- emqx_vm:loads()]),
     BrokerInfo = emqx_sys:info(),
     Info#{node              => node(),
           otp_release       => iolist_to_binary(otp_rel()),
-          memory_total      => proplists:get_value(allocated, Memory),
-          memory_used       => proplists:get_value(total, Memory),
+          memory_total      => Total,
+          memory_used       => erlang:round(Total * UsedRatio),
           process_available => erlang:system_info(process_limit),
           process_used      => erlang:system_info(process_count),
-          max_fds           => proplists:get_value(max_fds, lists:usort(lists:flatten(erlang:system_info(check_io)))),
+          max_fds           => proplists:get_value(max_fds,
+              lists:usort(lists:flatten(erlang:system_info(check_io)))),
           connections       => ets:info(emqx_channel, size),
           node_status       => 'Running',
           uptime            => iolist_to_binary(proplists:get_value(uptime, BrokerInfo)),
@@ -150,6 +158,14 @@ node_info(Node) when Node =:= node() ->
           };
 node_info(Node) ->
     rpc_call(Node, node_info, [Node]).
+
+get_sys_memory() ->
+    case os:type() of
+        {unix, linux} ->
+            load_ctl:get_sys_memory();
+        _ ->
+            {0, 0}
+    end.
 
 stopped_node_info(Node) ->
     #{name => Node, node_status => 'Stopped'}.
@@ -196,10 +212,12 @@ get_stats(Node) ->
 %%--------------------------------------------------------------------
 
 lookup_client({clientid, ClientId}, FormatFun) ->
-    lists:append([lookup_client(Node, {clientid, ClientId}, FormatFun) || Node <- ekka_mnesia:running_nodes()]);
+    lists:append([lookup_client(Node, {clientid, ClientId}, FormatFun)
+        || Node <- ekka_mnesia:running_nodes()]);
 
 lookup_client({username, Username}, FormatFun) ->
-    lists:append([lookup_client(Node, {username, Username}, FormatFun) || Node <- ekka_mnesia:running_nodes()]).
+    lists:append([lookup_client(Node, {username, Username}, FormatFun)
+        || Node <- ekka_mnesia:running_nodes()]).
 
 lookup_client(Node, {clientid, ClientId}, {M,F}) when Node =:= node() ->
     lists:append(lists:map(
@@ -222,10 +240,7 @@ lookup_client(Node, {username, Username}, FormatFun) ->
 
 kickout_client(ClientId) ->
     Results = [kickout_client(Node, ClientId) || Node <- ekka_mnesia:running_nodes()],
-    case lists:any(fun(Item) -> Item =:= ok end, Results) of
-        true  -> ok;
-        false -> lists:last(Results)
-    end.
+    has_any_ok(Results).
 
 kickout_client(Node, ClientId) when Node =:= node() ->
     emqx_cm:kick_session(ClientId);
@@ -238,10 +253,7 @@ list_acl_cache(ClientId) ->
 
 clean_acl_cache(ClientId) ->
     Results = [clean_acl_cache(Node, ClientId) || Node <- ekka_mnesia:running_nodes()],
-    case lists:any(fun(Item) -> Item =:= ok end, Results) of
-        true  -> ok;
-        false -> lists:last(Results)
-    end.
+    has_any_ok(Results).
 
 clean_acl_cache(Node, ClientId) when Node =:= node() ->
     case emqx_cm:lookup_channels(ClientId) of
@@ -255,15 +267,17 @@ clean_acl_cache(Node, ClientId) ->
     rpc_call(Node, clean_acl_cache, [Node, ClientId]).
 
 clean_acl_cache_all() ->
-    Results = [{Node, clean_acl_cache_all(Node)} || Node <- ekka_mnesia:running_nodes()],
-    case lists:filter(fun({_Node, Item}) -> Item =/= ok end, Results) of
+    for_nodes(fun clean_acl_cache_all/1).
+
+for_nodes(F) ->
+    Results = [{Node, F(Node)} || Node <- ekka_mnesia:running_nodes()],
+    case lists:filter(fun({_Node, Res}) -> Res =/= ok end, Results) of
         []  -> ok;
         BadNodes -> {error, BadNodes}
     end.
 
 clean_acl_cache_all(Node) when Node =:= node() ->
     emqx_acl_cache:drain_cache();
-
 clean_acl_cache_all(Node) ->
     rpc_call(Node, clean_acl_cache_all, [Node]).
 
@@ -273,6 +287,20 @@ set_ratelimit_policy(ClientId, Policy) ->
 set_quota_policy(ClientId, Policy) ->
     call_client(ClientId, {quota, Policy}).
 
+set_keepalive(ClientId, Interval)when Interval >= 0 andalso Interval =< 65535 ->
+    call_client(ClientId, {keepalive, Interval});
+set_keepalive(_ClientId, _Interval) ->
+    {error, ?ERROR2, <<"mqtt3.1.1 specification: keepalive must between 0~65535">>}.
+
+clean_pem_cache() ->
+    for_nodes(fun clean_pem_cache/1).
+
+clean_pem_cache(Node) when Node =:= node() ->
+    _ = ssl_pem_cache:clear(),
+    ok;
+clean_pem_cache(Node) ->
+    rpc_call(Node, ?FUNCTION_NAME, [Node]).
+
 %% @private
 call_client(ClientId, Req) ->
     Results = [call_client(Node, ClientId, Req) || Node <- ekka_mnesia:running_nodes()],
@@ -281,7 +309,7 @@ call_client(ClientId, Req) ->
                             end, Results),
     case Expected of
         [] -> {error, not_found};
-        [Result|_] -> Result
+        [Result | _] -> Result
     end.
 
 %% @private
@@ -292,7 +320,7 @@ call_client(Node, ClientId, Req) when Node =:= node() ->
             Pid = lists:last(Pids),
             case emqx_cm:get_chan_info(ClientId, Pid) of
                 #{conninfo := #{conn_mod := ConnMod}} ->
-                    ConnMod:call(Pid, Req);
+                    erlang:apply(ConnMod, call, [Pid, Req]);
                 undefined -> {error, not_found}
             end
     end;
@@ -313,27 +341,31 @@ list_subscriptions(Node) ->
     rpc_call(Node, list_subscriptions, [Node]).
 
 list_subscriptions_via_topic(Topic, FormatFun) ->
-    lists:append([list_subscriptions_via_topic(Node, Topic, FormatFun) || Node <- ekka_mnesia:running_nodes()]).
+    lists:append([list_subscriptions_via_topic(Node, Topic, FormatFun)
+        || Node <- ekka_mnesia:running_nodes()]).
+
 
 list_subscriptions_via_topic(Node, Topic, {M,F}) when Node =:= node() ->
     MatchSpec = [{{{'_', '$1'}, '_'}, [{'=:=','$1', Topic}], ['$_']}],
-    M:F(ets:select(emqx_suboption, MatchSpec));
+    erlang:apply(M, F, [ets:select(emqx_suboption, MatchSpec)]);
 
 list_subscriptions_via_topic(Node, Topic, FormatFun) ->
     rpc_call(Node, list_subscriptions_via_topic, [Node, Topic, FormatFun]).
 
-lookup_subscriptions(ClientId) ->
-    lists:append([lookup_subscriptions(Node, ClientId) || Node <- ekka_mnesia:running_nodes()]).
+lookup_subscriptions(ClientId, FormatFun) ->
+    lists:append([lookup_subscriptions(Node, ClientId, FormatFun) || Node <- ekka_mnesia:running_nodes()]).
 
-lookup_subscriptions(Node, ClientId) when Node =:= node() ->
-    case ets:lookup(emqx_subid, ClientId) of
-        [] -> [];
-        [{_, Pid}] ->
-            ets:match_object(emqx_suboption, {{Pid, '_'}, '_'})
-    end;
+lookup_subscriptions(Node, ClientId, {M, F}) when Node =:= node() ->
+    Result = case ets:lookup(emqx_subid, ClientId) of
+                 [] -> [];
+                 [{_, Pid}] ->
+                     ets:match_object(emqx_suboption, {{Pid, '_'}, '_'})
+             end,
+    %% format at the called node
+    erlang:apply(M, F, [Result]);
 
-lookup_subscriptions(Node, ClientId) ->
-    rpc_call(Node, lookup_subscriptions, [Node, ClientId]).
+lookup_subscriptions(Node, ClientId, FormatFun) ->
+    rpc_call(Node, lookup_subscriptions, [Node, ClientId, FormatFun]).
 
 %%--------------------------------------------------------------------
 %% Routes
@@ -435,8 +467,9 @@ list_listeners(Node) when Node =:= node() ->
     end, esockd:listeners()),
     Http = lists:map(fun({Protocol, Opts}) ->
         #{protocol        => Protocol,
-          listen_on       => proplists:get_value(port, Opts),
-          acceptors       => maps:get(num_acceptors, proplists:get_value(transport_options, Opts, #{}), 0),
+          listen_on       => format_http_bind(Opts),
+          acceptors       => maps:get( num_acceptors
+                                     , proplists:get_value(transport_options, Opts, #{}), 0),
           max_conns       => proplists:get_value(max_connections, Opts),
           current_conns   => proplists:get_value(all_connections, Opts),
           shutdown_count  => []}
@@ -475,7 +508,7 @@ delete_all_deactivated_alarms() ->
 delete_all_deactivated_alarms(Node) when Node =:= node() ->
     emqx_alarm:delete_all_deactivated_alarms();
 delete_all_deactivated_alarms(Node) ->
-    rpc_call(Node, delete_deactivated_alarms, [Node]).
+    rpc_call(Node, emqx_alarm, delete_all_deactivated_alarms, []).
 
 add_duration_field(Alarms) ->
     Now = erlang:system_time(microsecond),
@@ -483,9 +516,10 @@ add_duration_field(Alarms) ->
 
 add_duration_field([], _Now, Acc) ->
     Acc;
-add_duration_field([Alarm = #{activated := true, activate_at := ActivateAt}| Rest], Now, Acc) ->
+add_duration_field([Alarm = #{activated := true, activate_at := ActivateAt} | Rest], Now, Acc) ->
     add_duration_field(Rest, Now, [Alarm#{duration => Now - ActivateAt} | Acc]);
-add_duration_field([Alarm = #{activated := false, activate_at := ActivateAt, deactivate_at := DeactivateAt}| Rest], Now, Acc) ->
+add_duration_field([Alarm = #{activated := false,
+    activate_at := ActivateAt, deactivate_at := DeactivateAt} | Rest], Now, Acc) ->
     add_duration_field(Rest, Now, [Alarm#{duration => DeactivateAt - ActivateAt} | Acc]).
 
 %%--------------------------------------------------------------------
@@ -501,7 +535,7 @@ delete_banned(Who) ->
 
 
 %%--------------------------------------------------------------------
-%% Telemtry API
+%% Telemetry API
 %%--------------------------------------------------------------------
 
 -ifndef(EMQX_ENTERPRISE).
@@ -543,11 +577,14 @@ item(route, {Topic, Node}) ->
     #{topic => Topic, node => Node}.
 
 %%--------------------------------------------------------------------
-%% Internel Functions.
+%% Internal Functions.
 %%--------------------------------------------------------------------
 
 rpc_call(Node, Fun, Args) ->
-    case rpc:call(Node, ?MODULE, Fun, Args) of
+    rpc_call(Node, ?MODULE, Fun, Args).
+
+rpc_call(Node, Mod, Fun, Args) ->
+    case rpc:call(Node, Mod, Fun, Args) of
         {badrpc, Reason} -> {error, Reason};
         Res -> Res
     end.
@@ -560,7 +597,7 @@ check_row_limit(Tables) ->
 
 check_row_limit([], _Limit) ->
     ok;
-check_row_limit([Tab|Tables], Limit) ->
+check_row_limit([Tab | Tables], Limit) ->
     case table_size(Tab) > Limit of
         true  -> false;
         false -> check_row_limit(Tables, Limit)
@@ -571,4 +608,15 @@ max_row_limit() ->
 
 table_size(Tab) -> ets:info(Tab, size).
 
+has_any_ok(Results) ->
+    case lists:any(fun(Item) -> Item =:= ok end, Results) of
+        true -> ok;
+        false -> lists:last(Results)
+    end.
 
+format_http_bind(Opts) ->
+    Port = proplists:get_value(port, Opts),
+    case proplists:get_value(ip, Opts) of
+        undefined -> Port;
+        IP -> {IP, Port}
+    end.

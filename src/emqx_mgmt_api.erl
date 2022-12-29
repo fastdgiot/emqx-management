@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -23,12 +23,18 @@
 %% first_next query APIs
 -export([ params2qs/2
         , node_query/4
+        , node_query/5
+        , node_query/6
         , cluster_query/3
         , traverse_table/5
         , select_table/5
         ]).
 
 -export([do_query/5]).
+
+-export([ page/1
+        , limit/1
+        ]).
 
 paginate(Tables, Params, RowFun) ->
     Qh = query_handle(Tables),
@@ -49,17 +55,51 @@ paginate(Tables, Params, RowFun) ->
 
 query_handle(Table) when is_atom(Table) ->
     qlc:q([R|| R <- ets:table(Table)]);
+
+query_handle({Table, Opts}) when is_atom(Table) ->
+    qlc:q([R|| R <- ets:table(Table, Opts)]);
+
 query_handle([Table]) when is_atom(Table) ->
     qlc:q([R|| R <- ets:table(Table)]);
+
+query_handle([{Table, Opts}]) when is_atom(Table) ->
+    qlc:q([R|| R <- ets:table(Table, Opts)]);
+
 query_handle(Tables) ->
-    qlc:append([qlc:q([E || E <- ets:table(T)]) || T <- Tables]).
+    Fold = fun({Table, Opts}, Acc) ->
+                   Handle = qlc:q([R|| R <- ets:table(Table, Opts)]),
+                   [Handle | Acc];
+              (Table, Acc) ->
+                   Handle = qlc:q([R|| R <- ets:table(Table)]),
+                   [Handle | Acc]
+            end,
+    Handles = lists:foldl(Fold, [], Tables),
+    qlc:append(lists:reverse(Handles)).
+
+count_size(Table, undefined) ->
+    count(Table);
+count_size(_Table, CountFun) ->
+    CountFun().
 
 count(Table) when is_atom(Table) ->
     ets:info(Table, size);
+
+count({Table, _Opts}) when is_atom(Table) ->
+    ets:info(Table, size);
+
 count([Table]) when is_atom(Table) ->
     ets:info(Table, size);
+
+count([{Table, _Opts}]) when is_atom(Table) ->
+    ets:info(Table, size);
+
 count(Tables) ->
-    lists:sum([count(T) || T <- Tables]).
+    Fold = fun({Table, _Opts}, Acc) ->
+                   count(Table) ++ Acc;
+              (Table, Acc) ->
+                   count(Table) ++ Acc
+           end,
+    lists:foldl(Fold, 0, Tables).
 
 count(Table, Nodes) ->
     lists:sum([rpc_call(Node, ets, info, [Table, size], 5000) || Node <- Nodes]).
@@ -78,6 +118,12 @@ limit(Params) ->
 %%--------------------------------------------------------------------
 
 node_query(Node, Params, {Tab, QsSchema}, QueryFun) ->
+    node_query(Node, Params, {Tab, QsSchema}, QueryFun, undefined, undefined).
+
+node_query(Node, Params, {Tab, QsSchema}, QueryFun, SortFun) ->
+    node_query(Node, Params, {Tab, QsSchema}, QueryFun, SortFun, undefined).
+
+node_query(Node, Params, {Tab, QsSchema}, QueryFun, SortFun, CountFun) ->
     {CodCnt, Qs} = params2qs(Params, QsSchema),
     Limit = limit(Params),
     Page  = page(Params),
@@ -87,10 +133,15 @@ node_query(Node, Params, {Tab, QsSchema}, QueryFun) ->
     {_, Rows} = do_query(Node, Qs, QueryFun, Start, Limit+1),
     Meta = #{page => Page, limit => Limit},
     NMeta = case CodCnt =:= 0 of
-                true -> Meta#{count => count(Tab), hasnext => length(Rows) > Limit};
+                true -> Meta#{count => count_size(Tab, CountFun), hasnext => length(Rows) > Limit};
                 _ -> Meta#{count => -1, hasnext => length(Rows) > Limit}
             end,
-    #{meta => NMeta, data => lists:sublist(Rows, Limit)}.
+    Data0 = lists:sublist(Rows, Limit),
+    Data = case SortFun of
+               undefined -> Data0;
+               _ -> lists:sort(SortFun, Data0)
+           end,
+    #{meta => NMeta, data => Data}.
 
 %% @private
 do_query(Node, Qs, {M,F}, Start, Limit) when Node =:= node() ->
@@ -297,10 +348,12 @@ to_integer(I) when is_integer(I) ->
 to_integer(B) when is_binary(B) ->
     binary_to_integer(B).
 
+%% @doc The input timestamp time is in seconds, which needs to be
+%% converted to internal milliseconds here
 to_timestamp(I) when is_integer(I) ->
-    I;
+    I * 1000;
 to_timestamp(B) when is_binary(B) ->
-    binary_to_integer(B).
+    binary_to_integer(B) * 1000.
 
 aton(B) when is_binary(B) ->
     list_to_tuple([binary_to_integer(T) || T <- re:split(B, "[.]")]).
@@ -332,7 +385,7 @@ params2qs_test() ->
     ExpectedQs = [{str, '=:=', <<"abc">>},
                   {int, '=:=', 123},
                   {atom, '=:=', connected},
-                  {ts, '=:=', 156000},
+                  {ts, '=:=', 156000000},
                   {range, '>=', 1, '=<', 5}
                  ],
     FuzzyQs = [{fuzzy, like, <<"user">>},

@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2021-2022-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -39,13 +39,13 @@ cases() ->
     [t_import].
 
 init_per_suite(Config) ->
-    emqx_ct_helpers:start_apps([emqx_management, emqx_dashboard, emqx_auth_mnesia]),
+    emqx_ct_helpers:start_apps([emqx_management, emqx_auth_mnesia]),
     ekka_mnesia:start(),
     emqx_mgmt_auth:mnesia(boot),
     Config.
 
 end_per_suite(_Config) ->
-    emqx_ct_helpers:stop_apps([emqx_modules, emqx_management, emqx_dashboard, emqx_auth_mnesia]),
+    emqx_ct_helpers:stop_apps([emqx_modules, emqx_management, emqx_auth_mnesia]),
     ekka_mnesia:ensure_stopped().
 
 init_per_testcase(_, Config) ->
@@ -167,7 +167,7 @@ t_export_import(_Config) ->
 
     ?assertEqual([], emqx_acl_mnesia_db:all_acls()),
 
-    emqx_mgmt_data_backup:import_acl_mnesia(emqx_json:decode(AclData, [return_maps]), "4.3"),
+    emqx_mgmt_data_backup:import_acl_mnesia(emqx_json:decode(AclData, [return_maps])),
     timer:sleep(100),
 
     ?assertMatch([
@@ -183,7 +183,10 @@ do_import(File, Config, Overrides) ->
     mnesia:clear_table(?ACL_TABLE2),
     mnesia:clear_table(emqx_user),
     emqx_acl_mnesia_migrator:migrate_records(),
-    Filename = filename:join(proplists:get_value(data_dir, Config), File),
+    Filename = filename:basename(File),
+    FilePath = filename:join([proplists:get_value(data_dir, Config), File]),
+    {ok, Bin} = file:read_file(FilePath),
+    ok = emqx_mgmt_data_backup:upload_backup_file(Filename, Bin),
     emqx_mgmt_data_backup:import(Filename, Overrides).
 
 test_import(username, {Username, Password}) ->

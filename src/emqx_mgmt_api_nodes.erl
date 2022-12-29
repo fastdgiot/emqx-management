@@ -1,5 +1,5 @@
 %%--------------------------------------------------------------------
-%% Copyright (c) 2020-2021 EMQ Technologies Co., Ltd. All Rights Reserved.
+%% Copyright (c) 2020-2022 EMQ Technologies Co., Ltd. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -36,11 +36,10 @@ list(_Bindings, _Params) ->
     minirest:return({ok, [format(Node, Info) || {Node, Info} <- emqx_mgmt:list_nodes()]}).
 
 get(#{node := Node}, _Params) ->
-    minirest:return({ok, emqx_mgmt:lookup_node(Node)}).
+    minirest:return({ok, format(Node, emqx_mgmt:lookup_node(Node))}).
 
 format(Node, {error, Reason}) -> #{node => Node, error => Reason};
 
 format(_Node, Info = #{memory_total := Total, memory_used := Used}) ->
     Info#{memory_total := emqx_mgmt_util:kmg(Total),
           memory_used  := emqx_mgmt_util:kmg(Used)}.
-
